@@ -21,8 +21,6 @@ RUN seleniumbase install chromedriver
 
 COPY . .
 
-ENV PORT=8000
-EXPOSE 8000
 
 # Run Uvicorn server using Xvfb (virtual display) since SeleniumBase needs a display for non-headless UC mode
 # We use shell form (sh -c) so that the dynamic $PORT environment variable provided by Railway is evaluated
