@@ -114,6 +114,15 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
         # On Linux (Railway), use xvfb=True for virtual display (NOT headless!)
         # On Windows (local), use headed mode normally
         with SB(uc=True, proxy=proxy_str, xvfb=is_linux) as sb:
+            logger.info("Checking external IP to verify proxy...")
+            try:
+                sb.open("https://api.ipify.org")
+                time.sleep(2)  # Wait for load
+                ip_address = sb.get_text("body")
+                logger.info(f"== BROWSER IP ADDRESS: {ip_address} ==")
+            except Exception as e:
+                logger.warning(f"Failed to check IP: {e}")
+
             logger.info(f"Navigating to {PAGEURL}...")
             sb.open(PAGEURL)
 
