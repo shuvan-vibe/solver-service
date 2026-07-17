@@ -100,7 +100,7 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
     try:
         # UC mode auto-activates CDP mode on sb.open()
         # xvfb=True on Linux creates a virtual display (appears headed to Cloudflare)
-        with SB(uc=True, proxy=proxy_str, xvfb=is_linux) as sb:
+        with SB(uc=True, proxy=proxy_str, xvfb=is_linux, use_chromium=True, ad_block=True, locale_code="en") as sb:
             logger.info(f"Navigating to {PAGEURL}...")
             sb.open(PAGEURL)
             sb.wait_for_element("body", timeout=30)
