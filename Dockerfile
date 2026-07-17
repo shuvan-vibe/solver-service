@@ -23,5 +23,4 @@ COPY . .
 
 
 # Run Uvicorn server using Xvfb (virtual display) since SeleniumBase needs a display for non-headless UC mode
-# We use shell form (sh -c) so that the dynamic $PORT environment variable provided by Railway is evaluated
-CMD sh -c "xvfb-run --server-args=\"-screen 0 1024x768x24\" uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+CMD sh -c "xvfb-run --server-args=\"-screen 0 1024x768x24\" uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"
