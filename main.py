@@ -96,8 +96,8 @@ def solve_turnstile(proxy_str: Optional[str] = None, headless: bool = True) -> O
             logger.info(f"Navigating to {PAGEURL}...")
             sb.open(PAGEURL)
 
-            # Wait for the page body to exist
-            time.sleep(3)
+            # Wait for the page body to exist so we can append the Turnstile container
+            sb.wait_for_element("body", timeout=30)
 
             logger.info("Injecting Turnstile widget...")
             try:
