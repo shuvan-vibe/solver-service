@@ -113,6 +113,14 @@ def solve_turnstile(proxy_str: Optional[str] = None, headless: bool = True) -> O
             except Exception:
                 pass
 
+            time.sleep(2)
+            logger.info("Attempting to click Turnstile CAPTCHA (in case it requires interaction)...")
+            try:
+                sb.uc_gui_click_captcha()
+                logger.info("Clicked CAPTCHA checkbox.")
+            except Exception as e:
+                logger.info(f"Could not click CAPTCHA (maybe auto-solving or not present): {e}")
+
             # Poll for the token (auto-solved by stealth browser)
             logger.info("Waiting for Turnstile auto-solve (up to 30s)...")
             for i in range(60):
