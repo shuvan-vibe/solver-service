@@ -117,24 +117,30 @@ def solve_turnstile(proxy_config: Optional[dict] = None) -> Optional[str]:
         except:
             pass
 
+import traceback
+
 @app.get("/getToken")
 def get_token():
-    raw_proxy = os.environ.get("PROXY_URL", "")
-    proxy_config = parse_proxy(raw_proxy)
-    
-    start_time = time.time()
-    token = solve_turnstile(proxy_config)
-    elapsed = time.time() - start_time
-    
-    if token:
-        return JSONResponse(content={
-            "success": True,
-            "token": token,
-            "elapsed_s": round(elapsed, 2)
-        })
-    else:
-        # 503 Service Unavailable since we failed to get a token
-        raise HTTPException(status_code=503, detail="Failed to solve Turnstile")
+    try:
+        raw_proxy = os.environ.get("PROXY_URL", "")
+        proxy_config = parse_proxy(raw_proxy)
+        
+        start_time = time.time()
+        token = solve_turnstile(proxy_config)
+        elapsed = time.time() - start_time
+        
+        if token:
+            return JSONResponse(content={
+                "success": True,
+                "token": token,
+                "elapsed_s": round(elapsed, 2)
+            })
+        else:
+            return JSONResponse(content={"error": "Failed to solve Turnstile (token was None)"}, status_code=503)
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        logger.error(f"Unhandled exception in getToken: {error_traceback}")
+        return JSONResponse(content={"error": "Internal Server Error", "traceback": error_traceback}, status_code=500)
 
 if __name__ == "__main__":
     import uvicorn
