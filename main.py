@@ -73,6 +73,8 @@ INJECT_JS = f"""
         try {{
             var widgetId = window.turnstile.render('#__cf_turnstile_solver', {{
                 sitekey: '{SITEKEY}',
+                appearance: 'always',
+                theme: 'light',
                 callback: function(token) {{
                     window.__turnstileToken = token;
                     console.log('[Solver] Token received: ' + token.slice(0, 20) + '...');
