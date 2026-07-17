@@ -98,7 +98,7 @@ def solve_turnstile(proxy_str: Optional[str] = None) -> Optional[str]:
         # On Windows (local), use headed mode normally
         with SB(uc=True, proxy=proxy_str, xvfb=is_linux) as sb:
             logger.info(f"Navigating to {PAGEURL}...")
-            sb.uc_open_with_reconnect(PAGEURL, reconnect_time=5)
+            sb.open(PAGEURL)
 
             # Wait for the page body to exist so we can append the Turnstile container
             sb.wait_for_element("body", timeout=30)
