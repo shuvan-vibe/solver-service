@@ -113,16 +113,35 @@ def solve_turnstile(proxy_str: Optional[str] = None, headless: bool = True) -> O
             except Exception:
                 pass
 
-            time.sleep(2)
+            logger.info("Waiting for Turnstile iframe to render...")
+            try:
+                sb.wait_for_element("iframe[src*='challenges.cloudflare.com']", timeout=10)
+                time.sleep(3)  # Give it extra time to fully render the checkbox
+            except Exception:
+                logger.info("Could not find Turnstile iframe in DOM.")
+
             logger.info("Attempting to click Turnstile CAPTCHA (in case it requires interaction)...")
             try:
                 sb.uc_gui_click_captcha()
-                logger.info("Clicked CAPTCHA checkbox.")
+                logger.info("Clicked CAPTCHA using GUI method.")
             except Exception as e:
-                logger.info(f"Could not click CAPTCHA (maybe auto-solving or not present): {e}")
+                logger.info(f"GUI click failed: {e}")
+                
+            try:
+                # Fallback: try CDP click directly on the iframe
+                sb.uc_click("iframe[src*='challenges.cloudflare.com']")
+                logger.info("Clicked CAPTCHA using CDP method.")
+            except Exception as e:
+                pass
+
+            try:
+                sb.save_screenshot(os.path.join(SCREENSHOT_DIR, "screenshot_after_click.png"))
+                logger.info("Saved after-click screenshot.")
+            except Exception:
+                pass
 
             # Poll for the token (auto-solved by stealth browser)
-            logger.info("Waiting for Turnstile auto-solve (up to 30s)...")
+            logger.info("Waiting for Turnstile token (up to 30s)...")
             for i in range(60):
                 time.sleep(0.5)
                 try:
