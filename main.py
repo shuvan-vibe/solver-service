@@ -174,6 +174,11 @@ def get_token():
     try:
         raw_proxy = os.environ.get("PROXY_URL", "")
         proxy_config = parse_proxy(raw_proxy)
+        
+        if proxy_config:
+            logger.info("Using configured PROXY_URL")
+        else:
+            logger.warning("NO PROXY_URL CONFIGURED! Using datacenter IP (High risk of CAPTCHA block)")
 
         start_time = time.time()
         token = solve_turnstile(proxy_config, headless=True)
