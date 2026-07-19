@@ -165,14 +165,13 @@ def solve_turnstile() -> Optional[str]:
             global_sb = global_sb_context.__enter__()
             solve_count = 0
 
-            logger.info(f"Opening {PAGEURL} with uc_open_with_reconnect...")
-            global_sb.uc_open_with_reconnect(PAGEURL, reconnect_time=5)
+            logger.info(f"Opening {PAGEURL}...")
+            global_sb.open(PAGEURL)
+            time.sleep(3)  # Let page fully render before any interaction
         else:
             logger.info(f"Reusing existing browser (count={solve_count}). Refreshing page...")
-            try:
-                global_sb.uc_open_with_reconnect(PAGEURL, reconnect_time=3)
-            except Exception:
-                global_sb.open(PAGEURL)
+            global_sb.open(PAGEURL)
+            time.sleep(2)
 
         solve_count += 1
         sb = global_sb
@@ -191,7 +190,7 @@ def solve_turnstile() -> Optional[str]:
         # Wait for the Turnstile API script to load (async)
         logger.info("Waiting for Turnstile API to load...")
         api_loaded = False
-        for attempt in range(30):  # Up to 15 seconds
+        for attempt in range(40):  # Up to 20 seconds
             time.sleep(0.5)
             try:
                 status = sb.execute_script("""(function(){
@@ -212,11 +211,16 @@ def solve_turnstile() -> Optional[str]:
                     logger.info("Token auto-granted during API load wait!")
                     consecutive_failures = 0
                     return status['token']
+                
+                # At 5 seconds, check if inject was lost (page might have reloaded)
+                if attempt == 10 and not status.get('injected'):
+                    logger.warning("Injection lost — re-injecting Turnstile widget...")
+                    sb.execute_script(INJECT_JS)
             except Exception:
                 pass
 
         if not api_loaded:
-            logger.error("Turnstile API script never loaded!")
+            logger.warning("Turnstile API slow to load — continuing anyway...")
 
         # Check if token was auto-granted (invisible mode on trusted environments)
         token = sb.execute_script("window.__turnstileToken || null")
@@ -241,19 +245,20 @@ def solve_turnstile() -> Optional[str]:
         except Exception as e:
             logger.warning(f"uc_gui_click_captcha() failed: {e}")
 
-        # Strategy 2: solve_captcha (SeleniumBase's built-in solver)
-        logger.info("Strategy 2: Attempting sb.solve_captcha()...")
+        # Strategy 2: uc_gui_click_captcha retry with longer wait
+        logger.info("Strategy 2: Retrying uc_gui_click_captcha with extra wait...")
         try:
-            sb.solve_captcha()
-            logger.info("solve_captcha() completed")
-            time.sleep(2)
+            time.sleep(3)  # Give Turnstile more time to render
+            sb.uc_gui_click_captcha()
+            logger.info("uc_gui_click_captcha() retry completed")
+            time.sleep(3)
             token = sb.execute_script("window.__turnstileToken || null")
             if token and len(str(token)) > 10:
-                logger.info("Token obtained via solve_captcha!")
+                logger.info("Token obtained via uc_gui_click_captcha retry!")
                 consecutive_failures = 0
                 return token
         except Exception as e:
-            logger.warning(f"solve_captcha() failed: {e}")
+            logger.warning(f"uc_gui_click_captcha() retry failed: {e}")
 
         # Strategy 3: Direct click on the Turnstile widget container
         logger.info("Strategy 3: Attempting uc_click on widget...")
