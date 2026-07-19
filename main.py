@@ -280,10 +280,7 @@ def solve_turnstile() -> Optional[str]:
         # Strategy 1: uc_gui_click_captcha (best for Turnstile on Linux with Xvfb)
         logger.info("Strategy 1: Attempting uc_gui_click_captcha()...")
         try:
-            # Drop implicit wait temporarily so if CF selectors aren't found, it fails fast (1s instead of 10s+)
-            sb.driver.implicitly_wait(1)
             sb.uc_gui_click_captcha()
-            sb.driver.implicitly_wait(10)
             
             logger.info("uc_gui_click_captcha() completed")
             time.sleep(2)
@@ -294,7 +291,6 @@ def solve_turnstile() -> Optional[str]:
                 stabilize_browser()
                 return token
         except Exception as e:
-            sb.driver.implicitly_wait(10)
             logger.warning(f"uc_gui_click_captcha() failed: {e}")
 
         # Strategy 2: Direct click on the Turnstile iframe (Fastest, but sometimes detected)
