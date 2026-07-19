@@ -124,7 +124,7 @@ def solve_turnstile() -> Optional[str]:
     import platform
     global global_sb_context, global_sb, solve_count, consecutive_failures
 
-    raw_proxy = os.environ.get("PROXY_URL", "")
+    raw_proxy = os.environ.get("PROXY_URL") or os.environ.get("PROXY_URI", "")
     proxy_str = parse_proxy(raw_proxy)
     is_linux = platform.system() == "Linux"
 
