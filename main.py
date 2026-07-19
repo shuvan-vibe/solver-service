@@ -77,6 +77,7 @@ INJECT_JS = f"""
 
     var container = document.createElement('div');
     container.id = '__cf_turnstile_solver';
+    container.className = 'cf-turnstile-wrapper cf-turnstile';
     container.style.cssText = 'position:fixed;top:50px;left:50px;z-index:2147483647;background:white;padding:10px;';
     document.body.appendChild(container);
 
@@ -279,7 +280,11 @@ def solve_turnstile() -> Optional[str]:
         # Strategy 1: uc_gui_click_captcha (best for Turnstile on Linux with Xvfb)
         logger.info("Strategy 1: Attempting uc_gui_click_captcha()...")
         try:
+            # Drop implicit wait temporarily so if CF selectors aren't found, it fails fast (1s instead of 10s+)
+            sb.driver.implicitly_wait(1)
             sb.uc_gui_click_captcha()
+            sb.driver.implicitly_wait(10)
+            
             logger.info("uc_gui_click_captcha() completed")
             time.sleep(2)
             token = sb.execute_script("window.__turnstileToken || null")
@@ -289,28 +294,13 @@ def solve_turnstile() -> Optional[str]:
                 stabilize_browser()
                 return token
         except Exception as e:
+            sb.driver.implicitly_wait(10)
             logger.warning(f"uc_gui_click_captcha() failed: {e}")
 
-        # Strategy 2: uc_gui_click_captcha retry with longer wait
-        logger.info("Strategy 2: Retrying uc_gui_click_captcha with extra wait...")
+        # Strategy 2: Direct click on the Turnstile iframe (Fastest, but sometimes detected)
+        logger.info("Strategy 2: Attempting uc_click on iframe...")
         try:
-            time.sleep(3)  # Give Turnstile more time to render
-            sb.uc_gui_click_captcha()
-            logger.info("uc_gui_click_captcha() retry completed")
-            time.sleep(3)
-            token = sb.execute_script("window.__turnstileToken || null")
-            if token and len(str(token)) > 10:
-                logger.info("Token obtained via uc_gui_click_captcha retry!")
-                consecutive_failures = 0
-                stabilize_browser()
-                return token
-        except Exception as e:
-            logger.warning(f"uc_gui_click_captcha() retry failed: {e}")
-
-        # Strategy 3: Direct click on the Turnstile widget container
-        logger.info("Strategy 3: Attempting uc_click on widget...")
-        try:
-            sb.uc_click("#__cf_turnstile_solver")
+            sb.uc_click("iframe")
             logger.info("uc_click completed")
         except Exception as e:
             logger.warning(f"uc_click failed: {e}")
