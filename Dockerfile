@@ -52,17 +52,8 @@ ENV LC_ALL=en_US.UTF-8
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the custom Chromium binary during build time.
-# This eliminates the 40-second first-run delay on Railway.
-RUN python3 -c "\
-from seleniumbase import SB; \
-import sys; \
-try: \
-    with SB(uc=True, use_chromium=True, headless=True, xvfb=True) as sb: \
-        sb.open('about:blank'); \
-except: \
-    pass; \
-print('Chromium pre-download complete')"
+# Pre-download Chromium binary during build time to eliminate first-run delay.
+RUN sbase get chromedriver --path && sbase get uc_driver --path || true
 
 COPY . .
 
