@@ -135,8 +135,18 @@ def solve_turnstile() -> Optional[str]:
         logger.warning("NO PROXY CONFIGURED — will likely be detected on cloud servers!")
 
     try:
-        # Restart browser if first time, used 100+ times, or failed 3+ times in a row
-        if global_sb is None or solve_count >= 100 or consecutive_failures >= 3:
+        # Check if existing browser is still alive before deciding to reuse
+        browser_alive = False
+        if global_sb is not None and solve_count < 100 and consecutive_failures < 3:
+            try:
+                _ = global_sb.driver.title  # Quick health check
+                browser_alive = True
+            except Exception:
+                logger.warning("Browser died since last solve. Will launch fresh.")
+                browser_alive = False
+
+        # Restart browser if first time, used 100+ times, failed 3+ times, or browser is dead
+        if not browser_alive:
             logger.info(f"Browser state (count={solve_count}, failures={consecutive_failures}). Launching fresh browser.")
             consecutive_failures = 0
             if global_sb_context is not None:
@@ -149,16 +159,6 @@ def solve_turnstile() -> Optional[str]:
                 time.sleep(1)
 
             logger.info("Launching SeleniumBase UC browser...")
-            # xvfb=True on Linux: let SeleniumBase manage the virtual display
-            # This is critical — SB's internal CAPTCHA solving (uc_gui_click_captcha)
-            # requires SB to own the Xvfb lifecycle for proper coordination.
-            # use_chromium=True: Chrome 137+ removed --load-extension; Chromium keeps it
-            # (needed for proxy extension loading).
-            #
-            # Docker-specific flags (Railway, Render, etc.):
-            #   --no-sandbox: required when running as root in containers
-            #   --disable-dev-shm-usage: /dev/shm is only 64MB in Docker (Chrome needs more)
-            #   --disable-gpu: no GPU available in containers
             is_docker = os.path.exists("/.dockerenv") or os.environ.get("RAILWAY_ENVIRONMENT")
             docker_args = (
                 "--no-sandbox,--disable-dev-shm-usage,--disable-gpu"
@@ -183,7 +183,7 @@ def solve_turnstile() -> Optional[str]:
             logger.info(f"Opening {PAGEURL}...")
             global_sb.driver.set_page_load_timeout(45)
             global_sb.open(PAGEURL)
-            time.sleep(3)  # Let page fully render before any interaction
+            time.sleep(3)
         else:
             logger.info(f"Reusing existing browser (count={solve_count}). Refreshing page...")
             global_sb.driver.set_page_load_timeout(45)
