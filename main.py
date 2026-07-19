@@ -27,9 +27,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 SITEKEY = "0x4AAAAAADuXG2nt8DMgL_NF"
-# Use a non-existent page to load a lightweight 404 HTML (808 bytes)
-# instead of the heavy homepage. This saves massive proxy bandwidth!
-PAGEURL = "https://tma.foxigrow.com/404.html"
+# We use the original homepage since data usage is no longer a concern on the ISP proxy
+PAGEURL = "https://tma.foxigrow.com"
 
 
 def parse_proxy(raw_proxy: str) -> Optional[str]:
