@@ -181,6 +181,13 @@ def solve_turnstile() -> Optional[str]:
             global_sb = global_sb_context.__enter__()
             solve_count = 0
 
+            logger.info("Blocking target site heavy assets to save bandwidth...")
+            try:
+                global_sb.driver.execute_cdp_cmd('Network.setBlockedURLs', {"urls": ["*foxigrow.com/assets/*", "*telegram.org/*"]})
+                global_sb.driver.execute_cdp_cmd('Network.enable', {})
+            except Exception as e:
+                logger.warning(f"Could not set CDP blocked URLs: {e}")
+
             logger.info(f"Opening {PAGEURL}...")
             global_sb.open(PAGEURL)
             time.sleep(3)  # Let page fully render before any interaction
