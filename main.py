@@ -173,7 +173,6 @@ def solve_turnstile() -> Optional[str]:
                 headless=False,
                 use_chromium=True,
                 ad_block=True,
-                block_images=True,  # Save proxy bandwidth and speed up loading
                 locale_code="en",
                 chromium_arg=docker_args,
             )
