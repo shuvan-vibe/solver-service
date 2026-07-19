@@ -119,6 +119,23 @@ solve_count = 0
 consecutive_failures = 0
 
 
+def stabilize_browser():
+    """Navigate to about:blank to re-establish the WebDriver connection.
+    
+    uc_gui_click_captcha() internally disconnects/reconnects CDP,
+    which can leave the session broken. Navigating to about:blank
+    forces the driver to re-establish a healthy connection.
+    """
+    global global_sb
+    if global_sb is not None:
+        try:
+            global_sb.open("about:blank")
+            time.sleep(0.5)
+            logger.info("Browser stabilized for reuse.")
+        except Exception as e:
+            logger.warning(f"Could not stabilize browser: {e}")
+
+
 def solve_turnstile() -> Optional[str]:
     """Navigate to target page, inject Turnstile, auto-solve, return token."""
     from seleniumbase import SB
@@ -227,6 +244,7 @@ def solve_turnstile() -> Optional[str]:
                 if status and status.get('token'):
                     logger.info("Token auto-granted during API load wait!")
                     consecutive_failures = 0
+                    stabilize_browser()
                     return status['token']
                 
                 # At 5 seconds, check if inject was lost (page might have reloaded)
@@ -244,6 +262,7 @@ def solve_turnstile() -> Optional[str]:
         if token and len(str(token)) > 10:
             logger.info("Token auto-granted (invisible solve)!")
             consecutive_failures = 0
+            stabilize_browser()
             return token
 
         # === Try multiple solving strategies ===
@@ -258,6 +277,7 @@ def solve_turnstile() -> Optional[str]:
             if token and len(str(token)) > 10:
                 logger.info("Token obtained via uc_gui_click_captcha!")
                 consecutive_failures = 0
+                stabilize_browser()
                 return token
         except Exception as e:
             logger.warning(f"uc_gui_click_captcha() failed: {e}")
@@ -273,6 +293,7 @@ def solve_turnstile() -> Optional[str]:
             if token and len(str(token)) > 10:
                 logger.info("Token obtained via uc_gui_click_captcha retry!")
                 consecutive_failures = 0
+                stabilize_browser()
                 return token
         except Exception as e:
             logger.warning(f"uc_gui_click_captcha() retry failed: {e}")
@@ -294,6 +315,7 @@ def solve_turnstile() -> Optional[str]:
                 if token and len(str(token)) > 10:
                     logger.info(f"SUCCESS! Token obtained in {(i + 1) * 0.5:.1f}s")
                     consecutive_failures = 0
+                    stabilize_browser()
                     return token
 
                 error = sb.execute_script("window.__turnstileError || null")
