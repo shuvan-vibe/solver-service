@@ -163,7 +163,7 @@ def solve_turnstile() -> Optional[str]:
     try:
         # Check if existing browser is still alive before deciding to reuse
         browser_alive = False
-        if global_sb is not None and solve_count < 100 and consecutive_failures < 3:
+        if global_sb is not None and solve_count < 250 and consecutive_failures < 3:
             try:
                 _ = global_sb.driver.title  # Quick health check
                 browser_alive = True
@@ -171,7 +171,7 @@ def solve_turnstile() -> Optional[str]:
                 logger.warning("Browser died since last solve. Will launch fresh.")
                 browser_alive = False
 
-        # Restart browser if first time, used 100+ times, failed 3+ times, or browser is dead
+        # Restart browser if first time, used 250+ times, failed 3+ times, or browser is dead
         if not browser_alive:
             logger.info(f"Browser state (count={solve_count}, failures={consecutive_failures}). Launching fresh browser.")
             consecutive_failures = 0
