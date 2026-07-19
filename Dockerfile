@@ -1,8 +1,10 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.13-slim-bookworm
 
 WORKDIR /app
 
-# Install system dependencies and Official Google Chrome (required for stealth/Turnstile)
+# Install system dependencies for Xvfb, fonts, and locale
+# SeleniumBase with use_chromium=True downloads its own Chromium binary,
+# so we don't need to install Google Chrome separately.
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -13,20 +15,22 @@ RUN apt-get update && apt-get install -y \
     scrot \
     curl \
     unzip \
+    locales \
     fonts-liberation \
     fonts-noto \
     fonts-noto-color-emoji \
     fonts-indic \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
+
+# Set locale (critical for stealth — mismatched locale is a bot signal)
+RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Start FastAPI using uvicorn
+# Railway sets PORT env var automatically
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
