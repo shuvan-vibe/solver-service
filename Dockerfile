@@ -1,21 +1,43 @@
-FROM python:3.13-slim-bookworm
+FROM python:3.13-bookworm
 
 WORKDIR /app
 
-# Install system dependencies for Xvfb, fonts, and locale
-# SeleniumBase with use_chromium=True downloads its own Chromium binary,
-# so we don't need to install Google Chrome separately.
+# Install system dependencies:
+# - Xvfb + display: virtual framebuffer for headed browser in container
+# - Chromium runtime libs: libnss3, libgbm1, libasound2, etc. (needed by SeleniumBase's Chromium)
+# - Fonts: realistic font rendering (missing fonts = bot signal)
+# - Locale: en_US.UTF-8 (mismatched locale = bot signal)
 RUN apt-get update && apt-get install -y \
     wget \
+    curl \
+    unzip \
     gnupg \
     xvfb \
     python3-tk \
     python3-dev \
     python3-xlib \
     scrot \
-    curl \
-    unzip \
     locales \
+    # Chromium runtime dependencies (critical for slim/container images)
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libasound2 \
+    libatspi2.0-0 \
+    libgtk-3-0 \
+    libdbus-1-3 \
+    # Fonts
     fonts-liberation \
     fonts-noto \
     fonts-noto-color-emoji \
