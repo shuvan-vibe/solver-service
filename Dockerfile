@@ -52,11 +52,17 @@ ENV LC_ALL=en_US.UTF-8
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the massive custom Chromium binary during build time!
-# We run a dummy SB() call which triggers the download. The `|| true` ensures 
-# the build doesn't fail if the headless browser crashes in the build context,
-# because the download and extraction happens BEFORE the browser launches!
-RUN python3 -c "from seleniumbase import SB; sb = SB(uc=True, use_chromium=True, headless=True); sb.quit()" || true
+# Pre-download the custom Chromium binary during build time.
+# This eliminates the 40-second first-run delay on Railway.
+RUN python3 -c "\
+from seleniumbase import SB; \
+import sys; \
+try: \
+    with SB(uc=True, use_chromium=True, headless=True, xvfb=True) as sb: \
+        sb.open('about:blank'); \
+except: \
+    pass; \
+print('Chromium pre-download complete')"
 
 COPY . .
 

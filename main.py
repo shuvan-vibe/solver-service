@@ -120,17 +120,26 @@ consecutive_failures = 0
 
 
 def stabilize_browser():
-    """Navigate to about:blank to re-establish the WebDriver connection.
+    """Re-establish the WebDriver connection after uc_gui_click_captcha().
     
     uc_gui_click_captcha() internally disconnects/reconnects CDP,
-    which can leave the session broken. Navigating to about:blank
-    forces the driver to re-establish a healthy connection.
+    which can leave the session broken. We use reconnect() to properly
+    restore the UC mode connection, then navigate via raw Selenium
+    (bypassing SB's open() which triggers destructive CDP activation).
     """
     global global_sb
     if global_sb is not None:
         try:
-            global_sb.open("about:blank")
-            time.sleep(0.5)
+            # First try SeleniumBase's own reconnect method
+            try:
+                global_sb.reconnect(0.5)
+            except Exception:
+                pass
+            # Navigate via raw Selenium driver (bypasses SB's CDP wrapper)
+            global_sb.driver.get("about:blank")
+            time.sleep(0.3)
+            # Verify the connection is actually alive
+            _ = global_sb.driver.title
             logger.info("Browser stabilized for reuse.")
         except Exception as e:
             logger.warning(f"Could not stabilize browser: {e}")
