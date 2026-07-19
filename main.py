@@ -333,7 +333,6 @@ def solve_turnstile() -> Optional[str]:
 
     except Exception as e:
         logger.error(f"Error during solve: {e}")
-        logger.error(traceback.format_exc())
         logger.info("Forcing browser restart on next attempt to recover from error.")
         consecutive_failures = 3
         return None
