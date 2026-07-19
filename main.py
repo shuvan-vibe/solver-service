@@ -189,10 +189,12 @@ def solve_turnstile() -> Optional[str]:
                 logger.warning(f"Could not set CDP blocked URLs: {e}")
 
             logger.info(f"Opening {PAGEURL}...")
+            global_sb.driver.set_page_load_timeout(45)
             global_sb.open(PAGEURL)
             time.sleep(3)  # Let page fully render before any interaction
         else:
             logger.info(f"Reusing existing browser (count={solve_count}). Refreshing page...")
+            global_sb.driver.set_page_load_timeout(45)
             global_sb.open(PAGEURL)
             time.sleep(2)
 
@@ -332,7 +334,8 @@ def solve_turnstile() -> Optional[str]:
     except Exception as e:
         logger.error(f"Error during solve: {e}")
         logger.error(traceback.format_exc())
-        consecutive_failures += 1
+        logger.info("Forcing browser restart on next attempt to recover from error.")
+        consecutive_failures = 3
         return None
 
 
