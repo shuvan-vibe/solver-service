@@ -153,6 +153,19 @@ def solve_turnstile() -> Optional[str]:
             # requires SB to own the Xvfb lifecycle for proper coordination.
             # use_chromium=True: Chrome 137+ removed --load-extension; Chromium keeps it
             # (needed for proxy extension loading).
+            #
+            # Docker-specific flags (Railway, Render, etc.):
+            #   --no-sandbox: required when running as root in containers
+            #   --disable-dev-shm-usage: /dev/shm is only 64MB in Docker (Chrome needs more)
+            #   --disable-gpu: no GPU available in containers
+            is_docker = os.path.exists("/.dockerenv") or os.environ.get("RAILWAY_ENVIRONMENT")
+            docker_args = (
+                "--no-sandbox,--disable-dev-shm-usage,--disable-gpu"
+                if is_docker else None
+            )
+            if is_docker:
+                logger.info("Docker/Railway environment detected — adding container-safe flags")
+            
             global_sb_context = SB(
                 uc=True,
                 proxy=proxy_str,
@@ -161,6 +174,7 @@ def solve_turnstile() -> Optional[str]:
                 use_chromium=True,
                 ad_block=True,
                 locale_code="en",
+                chromium_arg=docker_args,
             )
             global_sb = global_sb_context.__enter__()
             solve_count = 0
