@@ -66,8 +66,8 @@ def parse_proxy(raw_proxy: str) -> Optional[str]:
         return None
 
 
-def get_inject_js(sitekey):
-    return f"""
+# JavaScript to inject a Turnstile widget and capture its token
+INJECT_JS = f"""
 (function() {{
     if (window.__turnstileInjected) return;
     window.__turnstileInjected = true;
@@ -89,7 +89,7 @@ def get_inject_js(sitekey):
     window.__onTurnstileLoad = function() {{
         try {{
             var widgetId = window.turnstile.render('#__cf_turnstile_solver', {{
-                sitekey: '{sitekey}',
+                sitekey: '{SITEKEY}',
                 callback: function(token) {{
                     window.__turnstileToken = token;
                     console.log('[Solver] Token received');
@@ -146,7 +146,7 @@ def stabilize_browser():
             logger.warning(f"Could not stabilize browser: {e}")
 
 
-def solve_turnstile(sitekey=SITEKEY, pageurl=PAGEURL) -> Optional[str]:
+def solve_turnstile() -> Optional[str]:
     """Navigate to target page, inject Turnstile, auto-solve, return token."""
     from seleniumbase import SB
     import platform
@@ -207,14 +207,14 @@ def solve_turnstile(sitekey=SITEKEY, pageurl=PAGEURL) -> Optional[str]:
             global_sb = global_sb_context.__enter__()
             solve_count = 0
 
-            logger.info(f"Opening {pageurl}...")
+            logger.info(f"Opening {PAGEURL}...")
             global_sb.driver.set_page_load_timeout(45)
-            global_sb.open(pageurl)
+            global_sb.open(PAGEURL)
             time.sleep(3)
         else:
             logger.info(f"Reusing existing browser (count={solve_count}). Refreshing page...")
             global_sb.driver.set_page_load_timeout(45)
-            global_sb.open(pageurl)
+            global_sb.open(PAGEURL)
             time.sleep(2)
 
         solve_count += 1
@@ -225,7 +225,7 @@ def solve_turnstile(sitekey=SITEKEY, pageurl=PAGEURL) -> Optional[str]:
 
         logger.info("Injecting Turnstile widget...")
         try:
-            sb.execute_script(get_inject_js(sitekey))
+            sb.execute_script(INJECT_JS)
         except Exception as e:
             logger.error(f"Failed to inject widget: {e}")
             consecutive_failures += 1
@@ -378,42 +378,6 @@ def get_token():
             try:
                 logger.info(f"Solve attempt {attempt}/{max_retries}...")
                 token = solve_turnstile()
-
-                if token:
-                    elapsed = time.time() - start_time
-                    return JSONResponse(content={
-                        "success": True,
-                        "token": token,
-                        "elapsed_s": round(elapsed, 2),
-                        "attempts": attempt
-                    })
-                else:
-                    logger.warning(f"Attempt {attempt} failed, "
-                                  f"{'retrying...' if attempt < max_retries else 'giving up.'}")
-            except Exception as e:
-                logger.error(f"Attempt {attempt} error: {e}")
-
-        elapsed = time.time() - start_time
-        return JSONResponse(
-            content={"success": False, "error": "Failed after all retries", "elapsed_s": round(elapsed, 2)},
-            status_code=503
-        )
-
-
-SOCPUBLIC_SITEKEY = "0x4AAAAAAAufaStIBeFnOKze"
-SOCPUBLIC_PAGEURL = "https://socpublic.com/auth_login.html?captcha_type=Turnstile"
-
-@app.get("/getSocpublicToken")
-def get_socpublic_token():
-    """Solve a Turnstile captcha for Socpublic and return the token."""
-    with solve_lock:
-        max_retries = 3
-        start_time = time.time()
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Socpublic Solve attempt {attempt}/{max_retries}...")
-                token = solve_turnstile(sitekey=SOCPUBLIC_SITEKEY, pageurl=SOCPUBLIC_PAGEURL)
 
                 if token:
                     elapsed = time.time() - start_time
