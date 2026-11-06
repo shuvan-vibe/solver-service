@@ -9,8 +9,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "0 */5 * * *"
 
 concurrency:
   group: solver-service
@@ -118,7 +116,8 @@ jobs:
           export SOLVER_PUBLIC_URL="$URL"
 
           nohup python main.py > solver.log 2>&1 &
-          disown || true
+          SOLVER_PID=$!
+          echo "SOLVER_PID=$SOLVER_PID" >> "$GITHUB_ENV"
 
           READY=0
           for i in $(seq 1 60); do
@@ -144,7 +143,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Quick solve test
+      - name: Quick solve test (on push only)
+        if: github.event_name == 'push'
         id: quick_solve
         continue-on-error: true
         env:
@@ -180,15 +180,10 @@ jobs:
             cloudflared.log
           if-no-files-found: ignore
 
-      - name: Keep alive
-        env:
-          SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+      - name: Wait for solver auto-shutdown
         run: |
-          while true; do
-            sleep 60
-            if ! curl -fsS -H "X-API-Key: $SOLVER_API_KEY" "$SOLVER_PUBLIC_URL/health" > /dev/null; then
-              echo "Health check failed - dumping solver log"
-              tail -100 solver.log
-              exit 1
-            fi
+          echo "Solver is running (PID: $SOLVER_PID). Monitoring until auto-shutdown..."
+          while kill -0 "$SOLVER_PID" 2>/dev/null; do
+            sleep 5
           done
+          echo "Solver has shut down cleanly. Workflow complete."

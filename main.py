@@ -44,6 +44,8 @@ app = FastAPI(title="Turnstile Solver API", version=config.VERSION)
 # One browser, one solve at a time.
 solve_lock = threading.Lock()
 
+service_started_at = time.time()
+is_shutting_down = False
 global_sb_context = None
 global_sb = None
 solve_count = 0
@@ -948,6 +950,70 @@ async def login_proxy(request: Request, _=Depends(check_api_key)):
     }
 
 
+async def _trigger_clean_exit(reason: str = "idle"):
+    global is_shutting_down
+    if is_shutting_down:
+        return
+    is_shutting_down = True
+    logger.info("Initiating graceful auto-shutdown (reason: %s)...", reason)
+    if config.MONGO_URI:
+        try:
+            await asyncio.to_thread(_mark_offline)
+            logger.info("Marked solver offline in MongoDB.")
+        except Exception as exc:
+            logger.warning("Failed to mark offline in MongoDB: %s", exc)
+    try:
+        await run_in_threadpool(close_browser)
+    except Exception:
+        pass
+    xray_manager.stop_xray()
+    try:
+        import subprocess
+        subprocess.run(["pkill", "-f", "cloudflared"], check=False)
+    except Exception:
+        pass
+    logger.info("Auto-shutdown complete. Exiting runner process cleanly.")
+    os._exit(0)
+
+
+async def auto_shutdown_loop():
+    """Monitor runner activity and terminate when idle to save minutes and remain TOS-compliant."""
+    if not config.AUTO_SHUTDOWN_ENABLED:
+        logger.info("Auto-shutdown is disabled by configuration.")
+        return
+    logger.info(
+        "Auto-shutdown monitor active: initial timeout=%ss, post-solve idle=%ss",
+        config.AUTO_SHUTDOWN_INITIAL_TIMEOUT,
+        config.AUTO_SHUTDOWN_IDLE_TIMEOUT,
+    )
+    while True:
+        await asyncio.sleep(10)
+        if is_shutting_down:
+            break
+        if solve_lock.locked():
+            continue
+
+        now = time.time()
+        # Case 1: Runner started, but no requests arrived within initial timeout
+        if solve_count == 0 and (now - service_started_at > config.AUTO_SHUTDOWN_INITIAL_TIMEOUT):
+            await _trigger_clean_exit("initial_timeout_no_solves")
+            break
+
+        # Case 2: Solved at least once, and idle for post-solve timeout
+        if solve_count > 0 and last_solve_at > 0 and (now - last_solve_at > config.AUTO_SHUTDOWN_IDLE_TIMEOUT):
+            await _trigger_clean_exit("post_solve_idle")
+            break
+
+
+@app.post("/shutdown")
+async def shutdown_endpoint(_=Depends(check_api_key)):
+    """Explicitly trigger shutdown of solver runner."""
+    async def _do():
+        await asyncio.sleep(1)
+        await _trigger_clean_exit("explicit_shutdown_api")
+    asyncio.create_task(_do())
+    return {"status": "shutting_down"}
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -968,6 +1034,7 @@ async def _startup():
     asyncio.create_task(xray_manager.idle_monitor(lambda: solve_lock.locked()))
     asyncio.create_task(browser_idle_monitor())
     asyncio.create_task(heartbeat_loop())
+    asyncio.create_task(auto_shutdown_loop())
 
 
 @app.on_event("shutdown")

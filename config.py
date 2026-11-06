@@ -84,3 +84,8 @@ HEARTBEAT_INTERVAL = _int("HEARTBEAT_INTERVAL", 60)
 SP_USERNAME_PROXY = os.getenv("SP_USERNAME_PROXY", os.getenv("SP_USERNAME", "")).strip()
 SP_PASSWORD_PROXY = os.getenv("SP_PASSWORD_PROXY", os.getenv("SP_PASSWORD", "")).strip()
 
+# --- AUTO-SHUTDOWN (On-Demand Mode) ---
+AUTO_SHUTDOWN_ENABLED = _bool("AUTO_SHUTDOWN_ENABLED", True)
+AUTO_SHUTDOWN_INITIAL_TIMEOUT = _int("AUTO_SHUTDOWN_INITIAL_TIMEOUT", 180)  # Shut down if no requests in 3 mins
+AUTO_SHUTDOWN_IDLE_TIMEOUT = _int("AUTO_SHUTDOWN_IDLE_TIMEOUT", 60)        # Shut down after 60s idle following a solve
+
