@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import secrets
 import threading
 import time
@@ -25,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import unquote, urlparse
 
+import aiohttp
 import config
 import xray_manager
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -746,6 +748,205 @@ async def warmup(pageurl: Optional[str] = None, _=Depends(check_api_key)):
         return JSONResponse(
             status_code=503, content={"success": False, "error": str(exc)}
         )
+
+
+async def _submit_socpublic_login(username: str, password: str, token: str) -> dict:
+    """Submit credentials and Turnstile token to Socpublic via active proxy/tunnel."""
+    login_url = "https://socpublic.com/auth_login.html?act=enter"
+
+    proxy_url = None
+    if config.NETWORK_MODE == "xray":
+        proxy_url = f"http://127.0.0.1:{config.XRAY_HTTP_PORT}"
+    elif config.NETWORK_MODE == "proxy" and config.PROXY_URL:
+        parsed = parse_proxy(config.PROXY_URL)
+        if parsed:
+            proxy_url = f"http://{parsed}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        "Referer": "https://socpublic.com/auth_login.html?captcha_type=Turnstile",
+        "Origin": "https://socpublic.com",
+    }
+    data = {
+        "name": username,
+        "password": password,
+        "captcha_type": "Turnstile",
+        "cf-turnstile-response": token,
+    }
+
+    logger.info(
+        "Submitting Socpublic login (user=%s) via proxy %s...",
+        username,
+        proxy_url or "direct",
+    )
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
+        try:
+            async with session.post(
+                login_url,
+                data=data,
+                headers=headers,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=35),
+            ) as resp:
+                resp_status = resp.status
+                resp_url = str(resp.url)
+                resp_text = await resp.text(errors="ignore")
+        except Exception as exc:
+            logger.error("POST to login failed: %s", exc)
+            return {"success": False, "error": f"Login POST failed: {exc}"}
+
+        logger.info("Login response: status=%s, url=%s", resp_status, resp_url)
+        if "login.html" in resp_url or "auth" in resp_url or "captcha" in resp_text.lower():
+            alerts = re.findall(r'<div class="alert[^"]*">(.*?)</div>', resp_text, re.DOTALL)
+            err_msg = alerts[0].strip() if alerts else "Redirected to auth/login"
+            err_msg = re.sub(r"<[^>]+>", "", err_msg).strip()
+            logger.error("Login rejected by Socpublic: %s", err_msg)
+            return {"success": False, "error": f"Socpublic login rejected: {err_msg}"}
+
+        cookie_parts = []
+        for c in session.cookie_jar:
+            cookie_parts.append(f"{c.key}={c.value}")
+
+        if not cookie_parts:
+            logger.error("No cookies received in response")
+            return {"success": False, "error": "No cookies captured from login"}
+
+        # Verify on /account/task.html
+        verify_headers = dict(headers)
+        try:
+            async with session.get(
+                "https://socpublic.com/account/task.html",
+                headers=verify_headers,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as v_resp:
+                v_url = str(v_resp.url)
+                if "login.html" in v_url or "auth" in v_url:
+                    return {"success": False, "error": "Verification failed: redirected to login"}
+        except Exception as exc:
+            logger.warning("Cookie verification error: %s (continuing)", exc)
+
+        # Set pagination to 100
+        try:
+            async with session.get(
+                "https://socpublic.com/account/task.html?page_limit=100&page=1",
+                headers=verify_headers,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as limit_resp:
+                if limit_resp.status == 200:
+                    logger.info("Pagination limit set to 100.")
+        except Exception:
+            pass
+
+        cookie_str = "; ".join(cookie_parts)
+        return {"success": True, "cookie": cookie_str}
+
+
+@app.api_route("/loginProxy", methods=["GET", "POST"])
+async def login_proxy(request: Request, _=Depends(check_api_key)):
+    """Solve Turnstile and log into Socpublic via proxy, saving cookie to DB."""
+    user = request.query_params.get("username")
+    pwd = request.query_params.get("password")
+    if request.method == "POST":
+        try:
+            body_json = await request.json()
+            if isinstance(body_json, dict):
+                user = body_json.get("username") or user
+                pwd = body_json.get("password") or pwd
+        except Exception:
+            pass
+
+    if not user:
+        user = config.SP_USERNAME_PROXY
+    if not pwd:
+        pwd = config.SP_PASSWORD_PROXY
+
+    if not user or not pwd:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing proxy username or password (pass via query/body or set SP_USERNAME_PROXY/SP_PASSWORD_PROXY)",
+        )
+
+    if config.NETWORK_MODE == "xray":
+        ok = await xray_manager.ensure_running()
+        if not ok:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "Xray tunnel unavailable"},
+            )
+
+    # 1. Obtain Turnstile token using seleniumbase UC browser
+    try:
+        solve_result = await run_in_threadpool(
+            _solve_with_lock, config.SOCPUBLIC_SITEKEY, config.SOCPUBLIC_PAGEURL
+        )
+    except SolveBusy:
+        return JSONResponse(
+            status_code=429,
+            content={"success": False, "error": "Solver busy, try again later"},
+        )
+
+    if not solve_result.get("success") or not solve_result.get("token"):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "error": "Failed to obtain Turnstile token",
+                "solve_result": solve_result,
+            },
+        )
+
+    token = solve_result["token"]
+    logger.info("Turnstile token acquired. Submitting proxy login...")
+
+    # 2. Submit login POST via proxy
+    login_result = await _submit_socpublic_login(user, pwd, token)
+    if not login_result.get("success"):
+        return JSONResponse(status_code=401, content=login_result)
+
+    cookie_str = login_result["cookie"]
+
+    # 3. Save to MongoDB
+    saved_to_db = False
+    if config.MONGO_URI:
+        try:
+            from pymongo import MongoClient
+
+            client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
+            db = client[config.MONGO_DB]
+            now_utc = datetime.now(timezone.utc)
+            db["session_cookies"].update_one(
+                {"_id": "proxy"},
+                {
+                    "$set": {
+                        "cookie": cookie_str,
+                        "updated_at": now_utc,
+                        "is_expired": False,
+                        "source": "solver_loginProxy",
+                    }
+                },
+                upsert=True,
+            )
+            db["bot_data"].update_one(
+                {"_id": "reboot_counter"},
+                {"$set": {"reboot_count_proxy": 0, "updated_at": now_utc}},
+                upsert=True,
+            )
+            saved_to_db = True
+            logger.info("Saved proxy cookie to MongoDB (session_cookies._id='proxy').")
+        except Exception as db_exc:
+            logger.warning("Failed to save proxy cookie to MongoDB: %s", db_exc)
+
+    return {
+        "success": True,
+        "cookie": cookie_str,
+        "saved_to_db": saved_to_db,
+        "solve_elapsed_s": solve_result.get("elapsed_s"),
+    }
+
 
 
 # ---------------------------------------------------------------------------

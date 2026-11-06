@@ -90,6 +90,8 @@ jobs:
           XRAY_VLESS_CONFIG: ${{ secrets.XRAY_VLESS_CONFIG }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          SP_USERNAME_PROXY: ${{ secrets.SP_USERNAME_PROXY }}
+          SP_PASSWORD_PROXY: ${{ secrets.SP_PASSWORD_PROXY }}
           XRAY_BINARY: ${{ github.workspace }}/vendor/xray/xray
           XRAY_DIR: ${{ github.workspace }}/vendor/xray
         run: |

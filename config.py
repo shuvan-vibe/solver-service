@@ -79,3 +79,8 @@ MONGO_URI = (os.getenv("MONGO_URI") or os.getenv("MONGO_URL") or "").strip()
 MONGO_DB = os.getenv("MONGO_DB", "socpublic_db")
 SOLVER_STATUS_COLLECTION = os.getenv("SOLVER_STATUS_COLLECTION", "solver_status")
 HEARTBEAT_INTERVAL = _int("HEARTBEAT_INTERVAL", 60)
+
+# --- PROXY SCANNER CREDENTIALS (for /loginProxy) ---
+SP_USERNAME_PROXY = os.getenv("SP_USERNAME_PROXY", os.getenv("SP_USERNAME", "")).strip()
+SP_PASSWORD_PROXY = os.getenv("SP_PASSWORD_PROXY", os.getenv("SP_PASSWORD", "")).strip()
+
