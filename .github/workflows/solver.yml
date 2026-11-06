@@ -1,13 +1,17 @@
-name: Turnstile Solver Service
+# Standalone-repo copy of the solver workflow.
+# Use this only if the repository root is Solver-Service/.
+# For the monorepo layout (repo root = Socpublic), use
+# ../../.github/workflows/solver-service.yml instead.
+
+name: Solver Service
 
 on:
-  # Manual trigger from GitHub Actions UI
+  push:
+    branches: [main]
   workflow_dispatch:
-  # Auto-restart every 5 hours (GitHub kills jobs at 6 hours)
   schedule:
     - cron: "0 */5 * * *"
 
-# Cancel any previous run when a new one starts
 concurrency:
   group: solver-service
   cancel-in-progress: true
@@ -15,90 +19,174 @@ concurrency:
 jobs:
   run-solver:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 350
     env:
       PY_COLORS: "1"
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
+      XRAY_VERSION: "1.8.7"
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.13
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.13"
+      - name: Check required secrets
+        env:
+          SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+          XRAY_VLESS_CONFIG: ${{ secrets.XRAY_VLESS_CONFIG }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+        run: |
+          missing=0
+          [ -n "$SOLVER_API_KEY" ] || { echo "::error::Missing SOLVER_API_KEY secret"; missing=1; }
+          [ -n "$XRAY_VLESS_CONFIG" ] || { echo "::error::Missing XRAY_VLESS_CONFIG secret"; missing=1; }
+          if [ -z "$MONGO_URI" ]; then
+            echo "::warning::MONGO_URI is not set - the tunnel URL will not be published to MongoDB"
+          fi
+          exit $missing
 
-    - name: Install Linux Dependencies (Locale, Virtual Display, Fonts)
-      run: |
-        sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          tzdata \
-          locales \
-          xvfb \
-          python3-tk \
-          python3-dev \
-          python3-xlib \
-          scrot \
-          fonts-liberation \
-          fonts-noto \
-          fonts-noto-color-emoji
-        sudo locale-gen en_US.UTF-8
-        sudo update-locale LANG=en_US.UTF-8
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-    - name: Install Python Requirements
-      run: |
-        python -m pip install --upgrade pip wheel setuptools
-        pip install -r requirements.txt
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            tzdata locales xvfb python3-tk python3-dev python3-xlib scrot \
+            fonts-liberation fonts-noto fonts-noto-color-emoji
+          sudo locale-gen en_US.UTF-8
+          sudo update-locale LANG=en_US.UTF-8
 
-    - name: Install Cloudflare Tunnel
-      run: |
-        curl -L 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64' -o cloudflared
-        chmod +x cloudflared
+      - name: Cache Xray binary
+        id: cache-xray
+        uses: actions/cache@v4
+        with:
+          path: vendor/xray
+          key: xray-${{ env.XRAY_VERSION }}-${{ runner.os }}
 
-    - name: Quick Solve Test
-      env:
-        PROXY_URL: ${{ secrets.PROXY_URL }}
-      run: |
-        echo "=== Starting solver for a quick test ==="
-        python main.py &
-        SERVER_PID=$!
-        sleep 8
+      - name: Download Xray
+        if: steps.cache-xray.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p vendor/xray
+          curl -L "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip
+          unzip -o /tmp/xray.zip xray -d vendor/xray
+          chmod +x vendor/xray/xray
+          rm -f /tmp/xray.zip
 
-        echo "=== Testing /getToken endpoint ==="
-        RESULT=$(curl -s --max-time 180 http://127.0.0.1:8080/getToken)
-        echo "Result: $RESULT"
+      - name: Install Python requirements
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
 
-        # Check if it succeeded
-        echo "$RESULT" | python -c "
-        import sys, json
-        data = json.load(sys.stdin)
-        if data.get('success'):
-            print('TEST PASSED! Token: ' + data['token'][:40] + '...')
-        else:
-            print('TEST FAILED: ' + data.get('error', 'unknown'))
-            sys.exit(1)
-        "
+      - name: Install cloudflared
+        run: |
+          curl -L 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64' -o cloudflared
+          chmod +x cloudflared
 
-        # Kill the test server
-        kill $SERVER_PID 2>/dev/null || true
-        sleep 2
+      - name: Start solver + tunnel
+        env:
+          SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+          XRAY_VLESS_CONFIG: ${{ secrets.XRAY_VLESS_CONFIG }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          XRAY_BINARY: ${{ github.workspace }}/vendor/xray/xray
+          XRAY_DIR: ${{ github.workspace }}/vendor/xray
+        run: |
+          set -u
 
-    - name: Start Solver API Server
-      env:
-        PROXY_URL: ${{ secrets.PROXY_URL }}
-      run: |
-        echo "=== Starting Solver API ==="
-        python main.py &
-        sleep 5
-        echo "Solver API is running on port 8080"
+          nohup ./cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cloudflared.log 2>&1 &
+          disown || true
 
-    - name: Start Cloudflare Tunnel
-      run: |
-        echo "==========================================="
-        echo "  STARTING CLOUDFLARE TUNNEL"
-        echo "  Look for the .trycloudflare.com URL below"
-        echo "  Use that URL as your solver URL"
-        echo "==========================================="
-        ./cloudflared tunnel --url http://127.0.0.1:8080
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "Could not obtain a cloudflared URL"
+            cat cloudflared.log
+            exit 1
+          fi
+
+          echo "Solver public URL: $URL"
+          echo "SOLVER_PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+          export SOLVER_PUBLIC_URL="$URL"
+
+          nohup python main.py > solver.log 2>&1 &
+          disown || true
+
+          READY=0
+          for i in $(seq 1 60); do
+            if curl -fsS -H "X-API-Key: $SOLVER_API_KEY" "$URL/health" > /tmp/health.json 2>/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" != "1" ]; then
+            echo "Solver did not become healthy"
+            tail -100 solver.log
+            exit 1
+          fi
+
+          echo "Health:"
+          cat /tmp/health.json
+          {
+            echo "### Solver health"
+            echo '```json'
+            cat /tmp/health.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Quick solve test
+        id: quick_solve
+        continue-on-error: true
+        env:
+          SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+        run: |
+          set +e
+          RESULT=$(curl -sS --max-time 240 -H "X-API-Key: $SOLVER_API_KEY" \
+            "$SOLVER_PUBLIC_URL/getSocpublicToken")
+          echo "$RESULT" | tee solve-test.json
+
+          {
+            echo "### Quick solve test"
+            echo '```json'
+            echo "$RESULT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if echo "$RESULT" | python -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('success') else 1)"; then
+            echo "TOKEN_OK"
+          else
+            echo "::warning::Quick solve did not return a token"
+            exit 1
+          fi
+
+      - name: Upload solve diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solve-test
+          path: |
+            solve-test.json
+            solver.log
+            cloudflared.log
+          if-no-files-found: ignore
+
+      - name: Keep alive
+        env:
+          SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+        run: |
+          while true; do
+            sleep 60
+            if ! curl -fsS -H "X-API-Key: $SOLVER_API_KEY" "$SOLVER_PUBLIC_URL/health" > /dev/null; then
+              echo "Health check failed - dumping solver log"
+              tail -100 solver.log
+              exit 1
+            fi
+          done

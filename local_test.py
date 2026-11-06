@@ -1,28 +1,44 @@
-import os
-from main import solve_turnstile, parse_proxy
+"""Run a real Socpublic solve locally.
+
+Usage:
+    python local_test.py
+    python local_test.py --sitekey 0x... --pageurl https://...
+"""
+
+import argparse
+import asyncio
 import logging
+
+import config
+import xray_manager
+from main import solve_turnstile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Proxy provided by the user
-RAW_PROXY = "5.175.215.9:6969:260423171zzjyea-country-us:qe0swevki65u"
 
-def run_test():
-    print("=== Testing Turnstile Solver Locally ===")
-    
-    proxy_str = parse_proxy(RAW_PROXY)
-    print(f"Parsed Proxy String: {proxy_str}")
-    
-    # Test WITH proxy to confirm full production flow
-    print("\nStarting solver WITH proxy (production mode)...")
-    token = solve_turnstile(proxy_str)
-    
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sitekey", default=config.SOCPUBLIC_SITEKEY)
+    parser.add_argument("--pageurl", default=config.SOCPUBLIC_PAGEURL)
+    parser.add_argument("--no-xray", action="store_true")
+    args = parser.parse_args()
+
+    if config.NETWORK_MODE == "xray" and not args.no_xray:
+        ok = await xray_manager.ensure_running()
+        if not ok:
+            print("Xray tunnel failed to start")
+            return 1
+
+    token = await asyncio.to_thread(solve_turnstile, args.sitekey, args.pageurl)
     if token:
-        print("\n[SUCCESS] Token obtained!")
-        print(f"Token (first 50 chars): {token[:50]}...")
-        print(f"Token length: {len(token)}")
-    else:
-        print("\n[FAILED] Could not get token.")
+        print("\n[SUCCESS] Token obtained")
+        print(f"token length : {len(token)}")
+        print(f"token        : {token[:80]}...")
+        return 0
+
+    print("\n[FAILED] No token")
+    return 1
+
 
 if __name__ == "__main__":
-    run_test()
+    raise SystemExit(asyncio.run(main()))

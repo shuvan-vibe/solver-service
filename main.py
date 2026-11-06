@@ -1,79 +1,336 @@
+"""Self-hosted Turnstile solver microservice.
+
+FastAPI + SeleniumBase UC browser.  The Xray/VLESS tunnel is started on demand
+and stopped again when idle, so the service can sit behind a Cloudflare tunnel
+without burning CPU/RAM between logins.
+
+Endpoints
+---------
+GET /                      - liveness (public)
+GET /health                - detailed status (API key)
+GET /getToken              - legacy foxigrow token (API key)
+GET /getSocpublicToken     - Socpublic login token (API key)
+GET /solve?sitekey=&pageurl= - generic token (API key)
+GET /warmup                - pre-start Xray + browser (API key)
 """
-Turnstile solver microservice using FastAPI and SeleniumBase UC mode.
 
-Strategy:
-  1. Launch a stealth browser via SeleniumBase UC mode with residential proxy
-  2. Navigate to https://tma.foxigrow.com using uc_open_with_reconnect
-  3. Inject the Cloudflare Turnstile widget for our sitekey
-  4. Use uc_gui_click_captcha() to auto-solve the Turnstile challenge
-  5. Extract the token from window.__turnstileToken callback
-  6. Return the token — used by the caller for /captcha/verify API
-
-Designed to run on GitHub Actions with Xvfb (managed by SeleniumBase) + residential proxy.
-"""
-
-import os
-import time
+import asyncio
 import logging
-import traceback
+import os
+import platform
+import secrets
 import threading
+import time
+from datetime import datetime, timezone
 from typing import Optional
-from fastapi import FastAPI
+from urllib.parse import unquote, urlparse
+
+import config
+import xray_manager
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Turnstile Solver API")
-solve_lock = threading.Lock()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-SITEKEY = "0x4AAAAAADuXG2nt8DMgL_NF"
-# We use the original homepage since data usage is no longer a concern on the ISP proxy
-PAGEURL = "https://tma.foxigrow.com"
+app = FastAPI(title="Turnstile Solver API", version=config.VERSION)
+
+# One browser, one solve at a time.
+solve_lock = threading.Lock()
+
+global_sb_context = None
+global_sb = None
+solve_count = 0
+consecutive_failures = 0
+last_solve_at = 0.0
+last_solve_success = None
 
 
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+async def check_api_key(request: Request):
+    if not config.SOLVER_API_KEY:
+        return
+    provided = request.headers.get("X-API-Key", "")
+    if not secrets.compare_digest(provided, config.SOLVER_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+# ---------------------------------------------------------------------------
+# Proxy helpers
+# ---------------------------------------------------------------------------
 def parse_proxy(raw_proxy: str) -> Optional[str]:
-    """
-    Parse proxy string into SeleniumBase format (USER:PASS@HOST:PORT).
-    
-    Accepts:
-      - USER:PASS@HOST:PORT  (already correct — pass through)
-      - HOST:PORT:USER:PASS  (legacy format — rearrange)
-    """
+    """Accept USER:PASS@HOST:PORT or HOST:PORT:USER:PASS."""
     if not raw_proxy or not raw_proxy.strip():
         return None
-    
     raw_proxy = raw_proxy.strip()
-    
-    # Format 1: USER:PASS@HOST:PORT — already in SeleniumBase format
-    if '@' in raw_proxy:
-        logger.info("Proxy format: USER:PASS@HOST:PORT (direct)")
+    if "@" in raw_proxy:
         return raw_proxy
-    
-    # Format 2: HOST:PORT:USER:PASS — legacy format, needs rearranging
     try:
-        parts = raw_proxy.split(':')
+        parts = raw_proxy.split(":")
         if len(parts) == 4:
             host, port, user, password = parts
-            formatted = f"{user}:{password}@{host}:{port}"
-            logger.info("Proxy format: HOST:PORT:USER:PASS (converted)")
-            return formatted
-        else:
-            logger.warning(f"Unsupported proxy format ({len(parts)} parts). "
-                          f"Expected USER:PASS@HOST:PORT or HOST:PORT:USER:PASS")
-            return None
-    except Exception as e:
-        logger.error(f"Failed to parse proxy: {e}")
+            return f"{user}:{password}@{host}:{port}"
+        logger.warning("Unsupported PROXY_URL format: expected 4 parts, got %s", len(parts))
+        return None
+    except Exception as exc:
+        logger.error("Failed to parse proxy: %s", exc)
         return None
 
 
-# JavaScript to inject a Turnstile widget and capture its token
-INJECT_JS = f"""
+def _get_proxy_str() -> Optional[str]:
+    if config.NETWORK_MODE == "xray":
+        if not xray_manager.is_proxy_available():
+            raise RuntimeError("Xray proxy is not available")
+        return xray_manager.get_browser_proxy()
+    if config.NETWORK_MODE == "proxy":
+        return parse_proxy(config.PROXY_URL)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Browser lifecycle
+# ---------------------------------------------------------------------------
+def browser_alive() -> bool:
+    if global_sb is None:
+        return False
+    try:
+        _ = global_sb.driver.title
+        return True
+    except Exception:
+        return False
+
+
+def close_browser():
+    global global_sb_context, global_sb, solve_count, consecutive_failures
+    if global_sb_context is not None:
+        try:
+            global_sb_context.__exit__(None, None, None)
+        except Exception:
+            pass
+    global_sb = None
+    global_sb_context = None
+    solve_count = 0
+    consecutive_failures = 0
+
+
+def _launch_browser(proxy_str: Optional[str], pageurl: str):
+    global global_sb_context, global_sb, solve_count, consecutive_failures
+
+    from seleniumbase import SB
+
+    is_linux = platform.system() == "Linux"
+    is_docker = os.path.exists("/.dockerenv") or bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+    )
+    docker_args = (
+        "--no-sandbox,--disable-dev-shm-usage,--disable-gpu" if is_docker else None
+    )
+
+    kwargs = dict(
+        uc=True,
+        proxy=proxy_str,
+        xvfb=is_linux,
+        headless=config.SOLVER_HEADLESS,
+        use_chromium=True,
+        ad_block=True,
+        locale_code="en",
+    )
+    if docker_args:
+        kwargs["chromium_arg"] = docker_args
+
+    logger.info(
+        "Launching SeleniumBase UC browser (proxy=%s)",
+        "configured" if proxy_str else "none",
+    )
+    ctx = SB(**kwargs)
+    sb = ctx.__enter__()
+
+    try:
+        sb.driver.set_page_load_timeout(45)
+        logger.info("Opening %s...", pageurl)
+        sb.open(pageurl)
+        time.sleep(3)
+    except Exception:
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        raise
+
+    global_sb_context = ctx
+    global_sb = sb
+    solve_count = 0
+    consecutive_failures = 0
+    return sb
+
+
+def _ensure_browser(proxy_str: Optional[str], pageurl: str):
+    global global_sb, solve_count, consecutive_failures
+
+    alive = False
+    if (
+        global_sb is not None
+        and solve_count < config.BROWSER_MAX_SOLVES
+        and consecutive_failures < config.BROWSER_MAX_FAILURES
+    ):
+        try:
+            _ = global_sb.driver.title
+            alive = True
+        except Exception:
+            alive = False
+
+    if not alive:
+        logger.info(
+            "Browser state (count=%s, failures=%s). Launching fresh browser.",
+            solve_count,
+            consecutive_failures,
+        )
+        close_browser()
+        _launch_browser(proxy_str, pageurl)
+    else:
+        logger.info("Reusing browser (count=%s). Refreshing page...", solve_count)
+        global_sb.driver.set_page_load_timeout(45)
+        global_sb.open(pageurl)
+        time.sleep(2)
+
+    return global_sb
+
+
+def stabilize_browser():
+    """Reconnect CDP after uc_gui_click_captcha() disconnects it."""
+    global global_sb
+    if global_sb is None:
+        return
+    try:
+        try:
+            global_sb.reconnect(0.5)
+        except Exception:
+            pass
+        global_sb.driver.get("about:blank")
+        time.sleep(0.3)
+        _ = global_sb.driver.title
+        logger.info("Browser stabilized for reuse.")
+    except Exception as exc:
+        logger.warning("Could not stabilize browser: %s", exc)
+
+
+def _finish_success(token: str) -> str:
+    global consecutive_failures, last_solve_success
+    consecutive_failures = 0
+    last_solve_success = True
+    stabilize_browser()
+    return token
+
+
+def _finish_failure():
+    global consecutive_failures, last_solve_success
+    consecutive_failures = config.BROWSER_MAX_FAILURES
+    last_solve_success = False
+
+
+# ---------------------------------------------------------------------------
+# Turnstile injection / solve
+# ---------------------------------------------------------------------------
+TOKEN_JS = """
+(function(){
+    // 1. Our injected widget's callback.
+    if (window.__turnstileToken) return window.__turnstileToken;
+    // 2. The page's own Cloudflare widget writes the token here.
+    var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+    for (var i = 0; i < inputs.length; i++) {
+        if (inputs[i].value) return inputs[i].value;
+    }
+    // 3. Ask the Turnstile API for any rendered widget's response.
+    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+        try {
+            var resp = window.turnstile.getResponse();
+            if (resp) return resp;
+        } catch(e) {}
+    }
+    return null;
+})()
+"""
+
+PAGE_STATE_JS = """
+(function(){
+    var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+    var values = [];
+    for (var i = 0; i < inputs.length; i++) values.push(!!inputs[i].value);
+    var iframes = [];
+    var frames = document.querySelectorAll('iframe');
+    for (var j = 0; j < frames.length; j++) {
+        iframes.push({
+            src: (frames[j].src || '').slice(0, 120),
+            visible: !!(frames[j].offsetWidth || frames[j].offsetHeight)
+        });
+    }
+    return {
+        url: location.href,
+        title: document.title,
+        turnstileExists: typeof window.turnstile !== 'undefined',
+        injected: !!window.__turnstileInjected,
+        injectedToken: window.__turnstileToken || null,
+        injectedError: window.__turnstileError || null,
+        cfWidgets: document.querySelectorAll('.cf-turnstile').length,
+        responseInputs: inputs.length,
+        responseInputsFilled: values,
+        iframes: iframes
+    };
+})()
+"""
+
+
+def _page_has_widget(sb) -> bool:
+    """True when the target page renders its own Turnstile widget."""
+    try:
+        return bool(
+            sb.execute_script(
+                """(function(){
+                    return !!document.querySelector('.cf-turnstile')
+                        || !!document.querySelector('input[name="cf-turnstile-response"]');
+                })()"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _capture_diagnostics(sb, tag: str = "timeout") -> None:
+    """Save a screenshot and dump page state so failures are debuggable."""
+    try:
+        path = os.path.join(os.getcwd(), f"{tag}.png")
+        sb.save_screenshot(path)
+        logger.info("Diagnostics screenshot: %s", path)
+    except Exception as exc:
+        logger.warning("Diagnostics screenshot failed: %s", exc)
+
+    try:
+        logger.info("Page state: %s", sb.execute_script(PAGE_STATE_JS))
+    except Exception as exc:
+        logger.warning("Page state dump failed: %s", exc)
+
+    try:
+        logger.info("Current URL: %s | title: %s", sb.get_current_url(), sb.get_page_title())
+    except Exception:
+        pass
+
+
+def get_inject_js(sitekey: str) -> str:
+    return f"""
 (function() {{
-    if (window.__turnstileInjected) return;
+    var existing = document.getElementById('__cf_turnstile_solver');
+    if (window.__turnstileInjected && existing) return;
     window.__turnstileInjected = true;
     window.__turnstileToken = null;
     window.__turnstileError = null;
     window.__turnstileWidgetId = null;
+    if (existing) existing.remove();
 
     var container = document.createElement('div');
     container.id = '__cf_turnstile_solver';
@@ -81,15 +338,11 @@ INJECT_JS = f"""
     container.style.cssText = 'position:fixed;top:50px;left:50px;z-index:2147483647;background:white;padding:10px;';
     document.body.appendChild(container);
 
-    var script = document.createElement('script');
-    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=__onTurnstileLoad';
-    script.async = true;
-    script.defer = true;
-
     window.__onTurnstileLoad = function() {{
         try {{
+            if (window.__turnstileWidgetId !== null) return;
             var widgetId = window.turnstile.render('#__cf_turnstile_solver', {{
-                sitekey: '{SITEKEY}',
+                sitekey: '{sitekey}',
                 callback: function(token) {{
                     window.__turnstileToken = token;
                     console.log('[Solver] Token received');
@@ -108,223 +361,129 @@ INJECT_JS = f"""
         }}
     }};
 
+    if (typeof window.turnstile !== 'undefined') {{
+        window.__onTurnstileLoad();
+        return;
+    }}
+
+    var script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=__onTurnstileLoad';
+    script.async = true;
+    script.defer = true;
     document.head.appendChild(script);
 }})();
 """
 
 
-# === Persistent browser state (reuse across requests for speed) ===
-global_sb_context = None
-global_sb = None
-solve_count = 0
-consecutive_failures = 0
-
-
-def stabilize_browser():
-    """Re-establish the WebDriver connection after uc_gui_click_captcha().
-    
-    uc_gui_click_captcha() internally disconnects/reconnects CDP,
-    which can leave the session broken. We use reconnect() to properly
-    restore the UC mode connection, then navigate via raw Selenium
-    (bypassing SB's open() which triggers destructive CDP activation).
-    """
-    global global_sb
-    if global_sb is not None:
-        try:
-            # First try SeleniumBase's own reconnect method
-            try:
-                global_sb.reconnect(0.5)
-            except Exception:
-                pass
-            # Navigate via raw Selenium driver (bypasses SB's CDP wrapper)
-            global_sb.driver.get("about:blank")
-            time.sleep(0.3)
-            # Verify the connection is actually alive
-            _ = global_sb.driver.title
-            logger.info("Browser stabilized for reuse.")
-        except Exception as e:
-            logger.warning(f"Could not stabilize browser: {e}")
-
-
-def solve_turnstile() -> Optional[str]:
+def solve_turnstile(sitekey: str, pageurl: str) -> Optional[str]:
     """Navigate to target page, inject Turnstile, auto-solve, return token."""
-    from seleniumbase import SB
-    import platform
-    global global_sb_context, global_sb, solve_count, consecutive_failures
+    global global_sb, solve_count
 
-    raw_proxy = os.environ.get("PROXY_URL") or os.environ.get("PROXY_URI", "")
-    proxy_str = parse_proxy(raw_proxy)
-    is_linux = platform.system() == "Linux"
-
-    if proxy_str:
-        logger.info("Using residential proxy for stealth")
-    else:
-        logger.warning("NO PROXY CONFIGURED — will likely be detected on cloud servers!")
+    proxy_str = _get_proxy_str()
 
     try:
-        # Check if existing browser is still alive before deciding to reuse
-        browser_alive = False
-        if global_sb is not None and solve_count < 250 and consecutive_failures < 3:
-            try:
-                _ = global_sb.driver.title  # Quick health check
-                browser_alive = True
-            except Exception:
-                logger.warning("Browser died since last solve. Will launch fresh.")
-                browser_alive = False
-
-        # Restart browser if first time, used 250+ times, failed 3+ times, or browser is dead
-        if not browser_alive:
-            logger.info(f"Browser state (count={solve_count}, failures={consecutive_failures}). Launching fresh browser.")
-            consecutive_failures = 0
-            if global_sb_context is not None:
-                try:
-                    global_sb_context.__exit__(None, None, None)
-                except Exception:
-                    pass
-                global_sb = None
-                global_sb_context = None
-                time.sleep(1)
-
-            logger.info("Launching SeleniumBase UC browser...")
-            is_docker = os.path.exists("/.dockerenv") or os.environ.get("RAILWAY_ENVIRONMENT")
-            docker_args = (
-                "--no-sandbox,--disable-dev-shm-usage,--disable-gpu"
-                if is_docker else None
-            )
-            if is_docker:
-                logger.info("Docker/Railway environment detected — adding container-safe flags")
-            
-            global_sb_context = SB(
-                uc=True,
-                proxy=proxy_str,
-                xvfb=is_linux,
-                headless=False,
-                use_chromium=True,
-                ad_block=True,
-                locale_code="en",
-                chromium_arg=docker_args,
-            )
-            global_sb = global_sb_context.__enter__()
-            solve_count = 0
-
-            logger.info(f"Opening {PAGEURL}...")
-            global_sb.driver.set_page_load_timeout(45)
-            global_sb.open(PAGEURL)
-            time.sleep(3)
-        else:
-            logger.info(f"Reusing existing browser (count={solve_count}). Refreshing page...")
-            global_sb.driver.set_page_load_timeout(45)
-            global_sb.open(PAGEURL)
-            time.sleep(2)
-
+        sb = _ensure_browser(proxy_str, pageurl)
         solve_count += 1
-        sb = global_sb
 
-        # Wait for the page body so we can inject the Turnstile container
         sb.wait_for_element("body", timeout=30)
 
-        logger.info("Injecting Turnstile widget...")
+        logger.info("Injecting Turnstile widget (sitekey=%s)...", sitekey)
         try:
-            sb.execute_script(INJECT_JS)
-        except Exception as e:
-            logger.error(f"Failed to inject widget: {e}")
-            consecutive_failures += 1
+            sb.execute_script(get_inject_js(sitekey))
+        except Exception as exc:
+            logger.error("Failed to inject widget: %s", exc)
+            _finish_failure()
             return None
 
-        # Wait for the Turnstile API script to load (async)
         logger.info("Waiting for Turnstile API to load...")
         api_loaded = False
-        for attempt in range(40):  # Up to 20 seconds
+        for attempt in range(40):  # up to 20s
             time.sleep(0.5)
             try:
-                status = sb.execute_script("""(function(){
-                    return {
-                        turnstileExists: typeof window.turnstile !== 'undefined',
-                        injected: !!window.__turnstileInjected,
-                        token: window.__turnstileToken || null,
-                        error: window.__turnstileError || null
-                    };
-                })()""")
-
-                if status and status.get('turnstileExists'):
-                    api_loaded = True
-                    logger.info(f"Turnstile API loaded after {(attempt + 1) * 0.5:.1f}s")
-                    time.sleep(3)  # Extra time for iframe to render
-                    break
-                if status and status.get('token'):
+                status = sb.execute_script(
+                    """(function(){
+                        var pageToken = null;
+                        var inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                        for (var i = 0; i < inputs.length; i++) {
+                            if (inputs[i].value) { pageToken = inputs[i].value; break; }
+                        }
+                        if (!pageToken && window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                            try { pageToken = window.turnstile.getResponse(); } catch(e) {}
+                        }
+                        return {
+                            turnstileExists: typeof window.turnstile !== 'undefined',
+                            injected: !!window.__turnstileInjected,
+                            token: window.__turnstileToken || pageToken || null,
+                            error: window.__turnstileError || null,
+                            cfWidgets: document.querySelectorAll('.cf-turnstile').length,
+                            iframes: document.querySelectorAll('iframe').length
+                        };
+                    })()"""
+                )
+                if status and status.get("token") and len(str(status["token"])) > 10:
                     logger.info("Token auto-granted during API load wait!")
-                    consecutive_failures = 0
-                    stabilize_browser()
-                    return status['token']
-                
-                # At 5 seconds, check if inject was lost (page might have reloaded)
-                if attempt == 10 and not status.get('injected'):
-                    logger.warning("Injection lost — re-injecting Turnstile widget...")
-                    sb.execute_script(INJECT_JS)
+                    return _finish_success(status["token"])
+                if status and status.get("turnstileExists"):
+                    api_loaded = True
+                    logger.info("Turnstile API loaded after %.1fs", (attempt + 1) * 0.5)
+                    time.sleep(3)  # let the iframe render
+                    break
+                if attempt == 10 and status and not status.get("injected"):
+                    logger.warning("Injection lost - re-injecting Turnstile widget...")
+                    sb.execute_script(get_inject_js(sitekey))
             except Exception:
                 pass
 
         if not api_loaded:
-            logger.warning("Turnstile API slow to load — continuing anyway...")
+            logger.warning("Turnstile API slow to load - continuing anyway...")
 
-        # Check if token was auto-granted (invisible mode on trusted environments)
-        token = sb.execute_script("window.__turnstileToken || null")
+        token = sb.execute_script(TOKEN_JS)
         if token and len(str(token)) > 10:
             logger.info("Token auto-granted (invisible solve)!")
-            consecutive_failures = 0
-            stabilize_browser()
-            return token
+            return _finish_success(token)
 
-        # === Try multiple solving strategies ===
-
-        # Strategy 1: uc_gui_click_captcha (best for Turnstile on Linux with Xvfb)
+        # Strategy 1: SeleniumBase's UC GUI click (best on Linux/Xvfb).
         logger.info("Strategy 1: Attempting uc_gui_click_captcha()...")
         try:
             sb.uc_gui_click_captcha()
-            
             logger.info("uc_gui_click_captcha() completed")
             time.sleep(2)
-            token = sb.execute_script("window.__turnstileToken || null")
+            token = sb.execute_script(TOKEN_JS)
             if token and len(str(token)) > 10:
                 logger.info("Token obtained via uc_gui_click_captcha!")
-                consecutive_failures = 0
-                stabilize_browser()
-                return token
-        except Exception as e:
-            logger.warning(f"uc_gui_click_captcha() failed: {e}")
+                return _finish_success(token)
+        except Exception as exc:
+            logger.warning("uc_gui_click_captcha() failed: %s", exc)
 
-        # Strategy 2: Direct click on the Turnstile iframe (Fastest, but sometimes detected)
+        # Strategy 2: direct iframe click.
         logger.info("Strategy 2: Attempting uc_click on iframe...")
         try:
             sb.uc_click("iframe")
             logger.info("uc_click completed")
-        except Exception as e:
-            logger.warning(f"uc_click failed: {e}")
+        except Exception as exc:
+            logger.warning("uc_click failed: %s", exc)
 
-        # Poll for the token (up to 30s)
         logger.info("Waiting for Turnstile token (up to 30s)...")
         for i in range(60):
             time.sleep(0.5)
             try:
-                token = sb.execute_script("window.__turnstileToken || null")
+                token = sb.execute_script(TOKEN_JS)
                 if token and len(str(token)) > 10:
-                    logger.info(f"SUCCESS! Token obtained in {(i + 1) * 0.5:.1f}s")
-                    consecutive_failures = 0
-                    stabilize_browser()
-                    return token
+                    logger.info("SUCCESS! Token obtained in %.1fs", (i + 1) * 0.5)
+                    return _finish_success(token)
 
                 error = sb.execute_script("window.__turnstileError || null")
                 if error:
-                    logger.warning(f"Turnstile widget error: {error}")
-                    # Reset error and try to reset the widget
-                    sb.execute_script("""
-                        window.__turnstileError = null;
-                        if (window.turnstile && window.__turnstileWidgetId !== null) {
-                            try { window.turnstile.reset(window.__turnstileWidgetId); } catch(e) {}
-                        }
-                    """)
+                    logger.warning("Turnstile widget error: %s", error)
+                    sb.execute_script(
+                        """(function(){
+                            window.__turnstileError = null;
+                            if (window.turnstile && window.__turnstileWidgetId !== null) {
+                                try { window.turnstile.reset(window.__turnstileWidgetId); } catch(e) {}
+                            }
+                        })()"""
+                    )
 
-                # At 10 seconds, try clicking again
                 if i == 20:
                     logger.info("Retrying click on Turnstile widget...")
                     try:
@@ -340,67 +499,292 @@ def solve_turnstile() -> Optional[str]:
         logger.error("Timeout: No Turnstile token after 30s")
         raise Exception("Turnstile timeout")
 
-    except Exception as e:
-        logger.error(f"Error during solve: {e}")
-        logger.info("Forcing browser restart on next attempt to recover from error.")
-        consecutive_failures = 3
+    except Exception as exc:
+        logger.error("Error during solve: %s", exc)
+        logger.info("Forcing browser restart on next attempt to recover.")
+        _finish_failure()
         return None
 
 
-@app.on_event("shutdown")
-def shutdown_event():
-    """Ensure the browser closes when the server shuts down."""
-    global global_sb_context, global_sb
-    if global_sb_context is not None:
-        logger.info("Shutting down global browser instance...")
+# ---------------------------------------------------------------------------
+# Solve orchestration
+# ---------------------------------------------------------------------------
+class SolveBusy(Exception):
+    pass
+
+
+def _solve_with_lock(sitekey: str, pageurl: str) -> dict:
+    global last_solve_at
+
+    if not solve_lock.acquire(timeout=config.SOLVER_MAX_WAIT):
+        raise SolveBusy()
+
+    try:
+        last_solve_at = time.time()
+        started = time.time()
+
+        for attempt in range(1, config.SOLVER_MAX_RETRIES + 1):
+            try:
+                logger.info(
+                    "Solve attempt %s/%s for %s",
+                    attempt,
+                    config.SOLVER_MAX_RETRIES,
+                    pageurl,
+                )
+                token = solve_turnstile(sitekey, pageurl)
+                if token:
+                    return {
+                        "success": True,
+                        "token": token,
+                        "elapsed_s": round(time.time() - started, 2),
+                        "attempts": attempt,
+                    }
+                logger.warning("Attempt %s failed", attempt)
+            except Exception as exc:
+                logger.error("Attempt %s error: %s", attempt, exc)
+
+        return {
+            "success": False,
+            "error": "Failed after all retries",
+            "elapsed_s": round(time.time() - started, 2),
+        }
+    finally:
+        solve_lock.release()
+
+
+def _warmup_browser(pageurl: str) -> None:
+    if not solve_lock.acquire(timeout=config.SOLVER_MAX_WAIT):
+        raise SolveBusy()
+    try:
+        _ensure_browser(_get_proxy_str(), pageurl)
+    finally:
+        solve_lock.release()
+
+
+async def _solve_common(sitekey: str, pageurl: str, label: str):
+    if config.NETWORK_MODE == "xray":
+        ok = await xray_manager.ensure_running()
+        if not ok:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "Xray tunnel unavailable"},
+            )
+
+    try:
+        result = await run_in_threadpool(_solve_with_lock, sitekey, pageurl)
+    except SolveBusy:
+        return JSONResponse(
+            status_code=429,
+            content={"success": False, "error": "Solver busy, try again later"},
+        )
+
+    logger.info(
+        "%s solve finished: success=%s elapsed=%ss",
+        label,
+        result.get("success"),
+        result.get("elapsed_s"),
+    )
+    return JSONResponse(
+        status_code=200 if result.get("success") else 503,
+        content=result,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Background tasks
+# ---------------------------------------------------------------------------
+def _write_heartbeat():
+    from pymongo import MongoClient
+
+    client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client[config.MONGO_DB]
+    doc = {
+        "healthy": True,
+        "version": config.VERSION,
+        "network_mode": config.NETWORK_MODE,
+        "xray_running": xray_manager.is_running(),
+        "browser_alive": browser_alive(),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if config.SOLVER_PUBLIC_URL:
+        doc["url"] = config.SOLVER_PUBLIC_URL
+    db[config.SOLVER_STATUS_COLLECTION].update_one(
+        {"_id": "active"}, {"$set": doc}, upsert=True
+    )
+
+
+def _mark_offline():
+    from pymongo import MongoClient
+
+    client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client[config.MONGO_DB]
+    db[config.SOLVER_STATUS_COLLECTION].update_one(
+        {"_id": "active"},
+        {
+            "$set": {
+                "healthy": False,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+
+async def heartbeat_loop():
+    if not config.MONGO_URI:
+        return
+    if not config.SOLVER_PUBLIC_URL:
+        logger.warning(
+            "MONGO_URI is set but SOLVER_PUBLIC_URL is missing - heartbeat disabled"
+        )
+        return
+    while True:
         try:
-            global_sb_context.__exit__(None, None, None)
+            await asyncio.to_thread(_write_heartbeat)
+        except Exception as exc:
+            logger.warning("Heartbeat failed: %s", exc)
+        await asyncio.sleep(config.HEARTBEAT_INTERVAL)
+
+
+async def browser_idle_monitor():
+    while True:
+        await asyncio.sleep(30)
+        if not last_solve_at:
+            continue
+        if time.time() - last_solve_at < config.BROWSER_IDLE_TIMEOUT:
+            continue
+        if not solve_lock.acquire(blocking=False):
+            continue
+        try:
+            if global_sb is not None:
+                logger.info(
+                    "Browser idle for %ss - closing browser",
+                    config.BROWSER_IDLE_TIMEOUT,
+                )
+                await run_in_threadpool(close_browser)
         except Exception:
-            pass
-        global_sb = None
-        global_sb_context = None
+            logger.exception("Browser idle close error")
+        finally:
+            solve_lock.release()
 
 
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Turnstile Solver API"}
+    return {
+        "status": "ok",
+        "service": "Turnstile Solver API",
+        "version": config.VERSION,
+    }
+
+
+@app.get("/health")
+async def health(_=Depends(check_api_key)):
+    return {
+        "status": "ok",
+        "version": config.VERSION,
+        "network_mode": config.NETWORK_MODE,
+        "xray": xray_manager.status(),
+        "browser_alive": browser_alive(),
+        "solve_count": solve_count,
+        "consecutive_failures": consecutive_failures,
+        "last_solve_at": last_solve_at,
+        "last_solve_success": last_solve_success,
+        "public_url": config.SOLVER_PUBLIC_URL or None,
+    }
 
 
 @app.get("/getToken")
-@app.get("/gettoken")
-def get_token():
-    """Solve a Turnstile captcha and return the token. Auto-retries up to 3 times."""
-    with solve_lock:
-        max_retries = 3
-        start_time = time.time()
+async def get_token(_=Depends(check_api_key)):
+    return await _solve_common(
+        config.DEFAULT_SITEKEY, config.DEFAULT_PAGEURL, "default"
+    )
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Solve attempt {attempt}/{max_retries}...")
-                token = solve_turnstile()
 
-                if token:
-                    elapsed = time.time() - start_time
-                    return JSONResponse(content={
-                        "success": True,
-                        "token": token,
-                        "elapsed_s": round(elapsed, 2),
-                        "attempts": attempt
-                    })
-                else:
-                    logger.warning(f"Attempt {attempt} failed, "
-                                  f"{'retrying...' if attempt < max_retries else 'giving up.'}")
-            except Exception as e:
-                logger.error(f"Attempt {attempt} error: {e}")
+@app.get("/getSocpublicToken")
+async def get_socpublic_token(_=Depends(check_api_key)):
+    return await _solve_common(
+        config.SOCPUBLIC_SITEKEY, config.SOCPUBLIC_PAGEURL, "socpublic"
+    )
 
-        elapsed = time.time() - start_time
+
+@app.get("/solve")
+async def solve(
+    sitekey: str,
+    pageurl: str,
+    _=Depends(check_api_key),
+):
+    parsed = urlparse(pageurl)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="pageurl must be an http(s) URL")
+    if len(pageurl) > 2048:
+        raise HTTPException(status_code=400, detail="pageurl is too long")
+    return await _solve_common(sitekey, pageurl, "generic")
+
+
+@app.get("/warmup")
+async def warmup(pageurl: Optional[str] = None, _=Depends(check_api_key)):
+    if config.NETWORK_MODE == "xray":
+        ok = await xray_manager.ensure_running()
+        if not ok:
+            return JSONResponse(
+                status_code=503,
+                content={"success": False, "error": "Xray tunnel unavailable"},
+            )
+
+    target = pageurl or config.SOCPUBLIC_PAGEURL
+    try:
+        await run_in_threadpool(_warmup_browser, target)
+        return {"success": True, "browser_alive": browser_alive()}
+    except SolveBusy:
         return JSONResponse(
-            content={"success": False, "error": "Failed after all retries", "elapsed_s": round(elapsed, 2)},
-            status_code=503
+            status_code=429,
+            content={"success": False, "error": "Solver busy, try again later"},
         )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=503, content={"success": False, "error": str(exc)}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def _startup():
+    logger.info(
+        "Solver service starting (version=%s, network_mode=%s)",
+        config.VERSION,
+        config.NETWORK_MODE,
+    )
+    if not config.SOLVER_API_KEY:
+        logger.warning(
+            "SOLVER_API_KEY is not set - API authentication is DISABLED (local dev only)"
+        )
+    if config.NETWORK_MODE == "xray":
+        logger.info("Xray is on-demand and will start with the first solve request")
+    asyncio.create_task(xray_manager.idle_monitor(lambda: solve_lock.locked()))
+    asyncio.create_task(browser_idle_monitor())
+    asyncio.create_task(heartbeat_loop())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    logger.info("Solver service shutting down")
+    try:
+        await run_in_threadpool(close_browser)
+    except Exception:
+        pass
+    xray_manager.stop_xray()
+    if config.MONGO_URI:
+        try:
+            await asyncio.to_thread(_mark_offline)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(app, host="0.0.0.0", port=config.PORT)
