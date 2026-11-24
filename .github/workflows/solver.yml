@@ -23,6 +23,7 @@ jobs:
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
       XRAY_VERSION: "1.8.7"
+      SOLVER_NETWORK_MODE: "direct"
 
     steps:
       - name: Checkout
@@ -31,12 +32,15 @@ jobs:
       - name: Check required secrets
         env:
           SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+          SOLVER_NETWORK_MODE: ${{ secrets.SOLVER_NETWORK_MODE || 'direct' }}
           XRAY_VLESS_CONFIG: ${{ secrets.XRAY_VLESS_CONFIG }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
         run: |
           missing=0
           [ -n "$SOLVER_API_KEY" ] || { echo "::error::Missing SOLVER_API_KEY secret"; missing=1; }
-          [ -n "$XRAY_VLESS_CONFIG" ] || { echo "::error::Missing XRAY_VLESS_CONFIG secret"; missing=1; }
+          if [ "$SOLVER_NETWORK_MODE" = "xray" ]; then
+            [ -n "$XRAY_VLESS_CONFIG" ] || { echo "::error::Missing XRAY_VLESS_CONFIG secret"; missing=1; }
+          fi
           if [ -z "$MONGO_URI" ]; then
             echo "::warning::MONGO_URI is not set - the tunnel URL will not be published to MongoDB"
           fi
@@ -85,6 +89,7 @@ jobs:
       - name: Start solver + tunnel
         env:
           SOLVER_API_KEY: ${{ secrets.SOLVER_API_KEY }}
+          SOLVER_NETWORK_MODE: ${{ secrets.SOLVER_NETWORK_MODE || 'direct' }}
           XRAY_VLESS_CONFIG: ${{ secrets.XRAY_VLESS_CONFIG }}
           MONGO_URI: ${{ secrets.MONGO_URI }}
           PROXY_URL: ${{ secrets.PROXY_URL }}

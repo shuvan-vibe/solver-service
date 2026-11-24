@@ -40,14 +40,9 @@ XRAY_VLESS_CONFIG = os.getenv("XRAY_VLESS_CONFIG", "").strip()
 XRAY_SUBSCRIPTION_URL = os.getenv("XRAY_SUBSCRIPTION_URL", "").strip()
 XRAY_PREFERRED_SERVER = os.getenv("XRAY_PREFERRED_SERVER", "").strip()
 
-NETWORK_MODE = os.getenv("SOLVER_NETWORK_MODE", "").strip().lower()
+NETWORK_MODE = os.getenv("SOLVER_NETWORK_MODE", "direct").strip().lower()
 if not NETWORK_MODE:
-    if XRAY_VLESS_CONFIG or XRAY_SUBSCRIPTION_URL:
-        NETWORK_MODE = "xray"
-    elif PROXY_URL:
-        NETWORK_MODE = "proxy"
-    else:
-        NETWORK_MODE = "direct"
+    NETWORK_MODE = "direct"
 
 # --- XRAY ---
 XRAY_VERSION = os.getenv("XRAY_VERSION", "1.8.7")
